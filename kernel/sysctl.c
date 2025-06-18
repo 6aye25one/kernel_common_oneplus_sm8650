@@ -137,7 +137,7 @@ int sysctl_legacy_va_layout;
 #endif
 
 #endif /* CONFIG_SYSCTL */
-
+extern int extra_free_kbytes;
 /*
  * /proc/sys support
  */
@@ -2246,6 +2246,13 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= min_free_kbytes_sysctl_handler,
 		.extra1		= SYSCTL_ZERO,
+	},
+	{	.procname	= "extra_free_kbytes",
+		.data		= &extra_free_kbytes,
+		.maxlen         = sizeof(extra_free_kbytes),
+		.mode           = 0644,
+		.proc_handler   = min_free_kbytes_sysctl_handler,
+		.extra1		= SYSCTL_ZERO
 	},
 	{
 		.procname	= "watermark_boost_factor",
