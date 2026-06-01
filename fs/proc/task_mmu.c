@@ -289,7 +289,7 @@ static void show_vma_header_prefix2(struct seq_file *m,
 	seq_put_hex_ll(m, " ", pgoff, 0);
 	seq_put_hex_ll(m, " ", MAJOR(dev), 0);
 	seq_put_hex_ll(m, ":", MINOR(dev), 0);
-	seq_put_decimal_ull(m, " ", ino, 0);
+	seq_put_decimal_ull(m, " ", ino);
 	seq_putc(m, ' ');
 }
 
