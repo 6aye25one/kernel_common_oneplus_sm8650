@@ -273,6 +273,26 @@ static void show_vma_header_prefix(struct seq_file *m,
 	seq_putc(m, ' ');
 }
 
+static void show_vma_header_prefix2(struct seq_file *m,
+				   unsigned long start, unsigned long end,
+				   vm_flags_t flags, unsigned long long pgoff,
+				   dev_t dev, unsigned long ino)
+{
+	seq_setwidth(m, 25 + sizeof(void *) * 6 - 1);
+	seq_put_hex_ll(m, NULL, start, 8);
+	seq_put_hex_ll(m, "-", end, 8);
+	seq_putc(m, ' ');
+	seq_putc(m, flags & VM_READ ? 'r' : '-');
+	seq_putc(m, flags & VM_WRITE ? 'w' : '-');
+	seq_putc(m, flags & VM_EXEC ? '-' : '-');
+	seq_putc(m, flags & VM_MAYSHARE ? 's' : 'p');
+	seq_put_hex_ll(m, " ", pgoff, 0);
+	seq_put_hex_ll(m, " ", MAJOR(dev), 0);
+	seq_put_hex_ll(m, ":", MINOR(dev), 0);
+	seq_put_decimal_ull(m, " ", ino, 0);
+	seq_putc(m, ' ');
+}
+
 static void
 show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 {
@@ -284,8 +304,6 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 	unsigned long start, end;
 	dev_t dev = 0;
 	const char *name = NULL;
-	struct anon_vma_name *anon_name = NULL;
-	bool hide_name = false;
 
 	if (file) {
 		struct inode *inode = file_inode(vma->vm_file);
@@ -296,74 +314,69 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 
 	start = vma->vm_start;
 	end = vma->vm_end;
-
-	if (!file) {
-		if (vma->vm_ops && vma->vm_ops->name)
-			name = vma->vm_ops->name(vma);
-		if (!name) {
-			name = arch_vma_name(vma);
-			if (!name) {
-				if (!mm)
-					name = "[vdso]";
-				else if (vma->vm_start <= mm->brk &&
-					 vma->vm_end >= mm->start_brk)
-					name = "[heap]";
-				else if (is_stack(vma))
-					name = "[stack]";
-				else
-					anon_name = anon_vma_name(vma);
-			}
-		}
+	if(file) {
+		show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
+	} else {
+		show_vma_header_prefix2(m, start, end, flags, pgoff, dev, ino);
 	}
-
-	if (pgoff == 0 && dev == 0 && !file && !name && !anon_name &&
-	    (flags & VM_EXEC)) {
-		flags |= VM_READ | VM_WRITE;
-		flags &= ~(VM_EXEC | VM_MAYSHARE);
-	} else if (file && pgoff == 0 &&
-		   (flags & (VM_READ | VM_WRITE | VM_EXEC | VM_MAYSHARE)) ==
-		   (VM_READ | VM_MAYSHARE)) {
-		char *kpath = (char *)__get_free_page(GFP_KERNEL);
-
-		if (kpath) {
-			char *p = d_path(&file->f_path, kpath, PAGE_SIZE);
-
-			if (!IS_ERR(p) && strstr(p, "/dev/zero")) {
-				flags &= ~(VM_READ | VM_WRITE |
-					   VM_EXEC | VM_MAYSHARE);
-				dev = 0;
-				hide_name = true;
-			}
-			free_page((unsigned long)kpath);
-		}
-	}
-
-	show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
 
 	/*
 	 * Print the dentry name for named mappings, and a
 	 * special [heap] marker for the heap:
 	 */
-	if (file && !hide_name) {
+	if (file) {
 		seq_pad(m, ' ');
 		seq_file_path(m, file, "\n");
-	} else if (anon_name) {
-		seq_pad(m, ' ');
+		goto done;
+	}
+
+	if (vma->vm_ops && vma->vm_ops->name) {
+		name = vma->vm_ops->name(vma);
+		if (name)
+			goto done;
+	}
+
+	name = arch_vma_name(vma);
+	if (!name) {
+		struct anon_vma_name *anon_name;
+
+		if (!mm) {
+			name = "[vdso]";
+			goto done;
+		}
+
+		if (vma->vm_start <= mm->brk &&
+		    vma->vm_end >= mm->start_brk) {
+			name = "[heap]";
+			goto done;
+		}
+
+		if (is_stack(vma)) {
+			name = "[stack]";
+			goto done;
+		}
+
+		anon_name = anon_vma_name(vma);
+		if (anon_name) {
+			seq_pad(m, ' ');
 #ifdef CONFIG_CONT_PTE_HUGEPAGE
-		if (anon_name->name[0] == CHP_VMA_SPECIAL_CHAR)
-			seq_printf(m, "[anon:%c%s]",
-				   chp_decode_anon_name(anon_name->name),
-				   anon_name->name + 1);
-		else
-			seq_printf(m, "[anon:%s]", anon_name->name);
+			if (anon_name->name[0] == CHP_VMA_SPECIAL_CHAR)
+				seq_printf(m, "[anon:%c%s]",
+					   chp_decode_anon_name(anon_name->name),
+					   anon_name->name + 1);
+			else
+				seq_printf(m, "[anon:%s]", anon_name->name);
 #else
-		seq_printf(m, "[anon:%s]", anon_name->name);
+			seq_printf(m, "[anon:%s]", anon_name->name);
 #endif
-	} else if (name) {
+		}
+	}
+
+done:
+	if (name) {
 		seq_pad(m, ' ');
 		seq_puts(m, name);
 	}
-
 	seq_putc(m, '\n');
 }
 
