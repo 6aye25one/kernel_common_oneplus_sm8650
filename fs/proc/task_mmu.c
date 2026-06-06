@@ -20,6 +20,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/uaccess.h>
 #include <linux/pkeys.h>
+#include <linux/string.h>
 #include <trace/hooks/mm.h>
 
 #include <asm/elf.h>
@@ -273,6 +274,26 @@ static void show_vma_header_prefix(struct seq_file *m,
 	seq_putc(m, ' ');
 }
 
+static bool maps_path_has_marker(struct file *file)
+{
+	char *buf, *p;
+	bool ret = false;
+
+	if (!file)
+		return false;
+
+	buf = __getname();
+	if (!buf)
+		return false;
+
+	p = file_path(file, buf, PATH_MAX);
+	if (!IS_ERR(p))
+		ret = strstr(p, "/dev/zero") || strstr(p, "treble");
+
+	__putname(buf);
+	return ret;
+}
+
 static void
 show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 {
@@ -300,6 +321,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 	if (!file) {
 		if (vma->vm_ops && vma->vm_ops->name)
 			name = vma->vm_ops->name(vma);
+
 		if (!name) {
 			name = arch_vma_name(vma);
 			if (!name) {
@@ -316,38 +338,41 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 		}
 	}
 
-	if (pgoff == 0 && dev == 0 && !file && !name && !anon_name &&
-	    (flags & VM_EXEC)) {
-		flags |= VM_READ | VM_WRITE;
-		flags &= ~(VM_EXEC | VM_MAYSHARE);
-	} else if (file && pgoff == 0 &&
-		   (flags & (VM_READ | VM_WRITE | VM_EXEC | VM_MAYSHARE)) ==
-		   (VM_READ | VM_MAYSHARE)) {
-		char *kpath = (char *)__get_free_page(GFP_KERNEL);
+	if (!file && !name && !anon_name &&
+	    (flags & VM_EXEC) && !(flags & VM_MAYSHARE)) {
+		flags = (flags | VM_READ | VM_WRITE) & ~VM_EXEC;
+	}
 
-		if (kpath) {
-			char *p = d_path(&file->f_path, kpath, PAGE_SIZE);
-
-			if (!IS_ERR(p) && strstr(p, "/dev/zero")) {
-				flags &= ~(VM_READ | VM_WRITE |
-					   VM_EXEC | VM_MAYSHARE);
-				dev = 0;
-				hide_name = true;
-			}
-			free_page((unsigned long)kpath);
-		}
+	if ((flags & VM_READ) && !(flags & VM_WRITE) && !(flags & VM_EXEC) &&
+	    (flags & VM_MAYSHARE) && maps_path_has_marker(file)) {
+		flags &= ~(VM_READ | VM_WRITE | VM_EXEC | VM_MAYSHARE);
+		pgoff = 0;
+		dev = 0;
+		ino = 0;
+		hide_name = true;
 	}
 
 	show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
+
+	if (hide_name) {
+		seq_putc(m, '\n');
+		return;
+	}
 
 	/*
 	 * Print the dentry name for named mappings, and a
 	 * special [heap] marker for the heap:
 	 */
-	if (file && !hide_name) {
+	if (file) {
 		seq_pad(m, ' ');
 		seq_file_path(m, file, "\n");
-	} else if (anon_name) {
+		goto done;
+	}
+
+	if (name)
+		goto done;
+
+	if (anon_name) {
 		seq_pad(m, ' ');
 #ifdef CONFIG_CONT_PTE_HUGEPAGE
 		if (anon_name->name[0] == CHP_VMA_SPECIAL_CHAR)
@@ -359,11 +384,13 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 #else
 		seq_printf(m, "[anon:%s]", anon_name->name);
 #endif
-	} else if (name) {
+	}
+
+done:
+	if (name) {
 		seq_pad(m, ' ');
 		seq_puts(m, name);
 	}
-
 	seq_putc(m, '\n');
 }
 
