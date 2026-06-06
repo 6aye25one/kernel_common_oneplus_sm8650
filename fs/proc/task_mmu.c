@@ -21,7 +21,7 @@
 #include <linux/uaccess.h>
 #include <linux/pkeys.h>
 #include <trace/hooks/mm.h>
-
+#include <linux/string.h>
 #include <asm/elf.h>
 #include <asm/tlb.h>
 #include <asm/tlbflush.h>
