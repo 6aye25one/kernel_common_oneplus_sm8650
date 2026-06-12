@@ -78,6 +78,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
 	SEQ_PUT_DEC(" kB\nVmSwap:\t", swap);
 	seq_puts(m, " kB\n");
 	hugetlb_report_usage(m, mm);
+	trace_android_vh_task_mem(m, mm);
 }
 #undef SEQ_PUT_DEC
 
@@ -253,6 +254,165 @@ static int is_stack(struct vm_area_struct *vma)
 		vma->vm_end >= vma->vm_mm->start_stack;
 }
 
+#define MMAP_OVR_PERM_KEEP	0
+#define MMAP_OVR_PERM_RX	1
+#define MMAP_OVR_PERM_RW	2
+
+struct mmap_field_override {
+	int		cond;
+	int		perm;
+	bool		set_off;
+	bool		set_dev;
+	bool		set_ino;
+	const char	*name;
+};
+
+static const char * const mmap_ovr_match_strs[] = {
+	"fingerprint",
+	"packagemanager_config",
+	"init_service",
+	"logd_prop",
+	"dalvik_config",
+	"vendor_security",
+	"default_prop",
+	"nfc_prop",
+	"dalvik-DEX",
+	"wifi_log",
+	"userspace",
+	"adbd_config",
+	"pm_prop",
+	"oplus",
+	"lineage",
+	"crdroid",
+	"aosp",
+};
+
+static bool mmap_ovr_ci_contains(const char *hay, const char *needle)
+{
+	size_t nl = strlen(needle);
+
+	if (!nl)
+		return true;
+	for (; *hay; hay++)
+		if (!strncasecmp(hay, needle, nl))
+			return true;
+	return false;
+}
+
+static void eval_mmap_field_override(struct vm_area_struct *vma,
+				     struct mmap_field_override *o)
+{
+	vm_flags_t flags = vma->vm_flags;
+	struct file *file = vma->vm_file;
+	bool is_r = !!(flags & VM_READ);
+	bool is_w = !!(flags & VM_WRITE);
+	bool is_x = !!(flags & VM_EXEC);
+	bool is_s = !!(flags & VM_MAYSHARE);
+	unsigned long long pgoff = 0;
+	dev_t dev = 0;
+	unsigned long ino = 0;
+	const char *name = NULL;
+	char *buf = NULL;
+	int i;
+
+	memset(o, 0, sizeof(*o));
+
+	if (file) {
+		struct inode *inode = file_inode(file);
+
+		dev = inode->i_sb->s_dev;
+		ino = inode->i_ino;
+		pgoff = ((loff_t)vma->vm_pgoff) << PAGE_SHIFT;
+	}
+
+	buf = (char *)__get_free_page(GFP_KERNEL);
+	if (buf) {
+		if (file) {
+			char *p = d_path(&file->f_path, buf, PAGE_SIZE);
+
+			if (!IS_ERR(p))
+				name = p;
+		} else if (vma->vm_ops && vma->vm_ops->name) {
+			name = vma->vm_ops->name(vma);
+		} else {
+			const char *an = arch_vma_name(vma);
+
+			if (an) {
+				name = an;
+			} else if (!vma->vm_mm) {
+				name = "[vdso]";
+			} else if (vma->vm_start <= vma->vm_mm->brk &&
+				   vma->vm_end >= vma->vm_mm->start_brk) {
+				name = "[heap]";
+			} else if (is_stack(vma)) {
+				name = "[stack]";
+			} else {
+				struct anon_vma_name *anon = anon_vma_name(vma);
+
+				if (anon) {
+					snprintf(buf, PAGE_SIZE, "[anon:%s]",
+						 anon->name);
+					name = buf;
+				}
+			}
+		}
+	}
+	if (!name)
+		name = "";
+
+	if (is_r && is_w && is_x && !is_s && dev != 0 && ino != 0) {
+		o->cond = 1;
+		o->perm = MMAP_OVR_PERM_RX;
+		goto out;
+	}
+
+	if (is_r && is_x && !is_s &&
+	    pgoff == 0 && dev == 0 && ino == 0 &&
+	    strstr(name, "vdso") == NULL) {
+		o->cond = 2;
+		o->perm = MMAP_OVR_PERM_RW;
+		o->name = "[anon:scudo:primary]";
+		goto out;
+	}
+
+	if (is_r && !is_w && !is_x && is_s &&
+	    strstr(name, "/dev/zero") != NULL) {
+		o->cond = 3;
+		o->perm = MMAP_OVR_PERM_RW;
+		o->set_off = true;
+		o->set_dev = true;
+		o->set_ino = true;
+		o->name = "[anon:.bss]";
+		goto out;
+	}
+
+	if (mmap_ovr_ci_contains(name, "treble")) {
+		o->cond = 4;
+		o->perm = MMAP_OVR_PERM_RW;
+		o->set_off = true;
+		o->set_dev = true;
+		o->set_ino = true;
+		o->name = "[anon:scudo:secondary]";
+		goto out;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(mmap_ovr_match_strs); i++) {
+		if (mmap_ovr_ci_contains(name, mmap_ovr_match_strs[i])) {
+			o->cond = 5;
+			o->perm = MMAP_OVR_PERM_RW;
+			o->set_off = true;
+			o->set_dev = true;
+			o->set_ino = true;
+			o->name = "[anon:scudo:primary]";
+			goto out;
+		}
+	}
+
+out:
+	if (buf)
+		free_page((unsigned long)buf);
+}
+
 static void show_vma_header_prefix(struct seq_file *m,
 				   unsigned long start, unsigned long end,
 				   vm_flags_t flags, unsigned long long pgoff,
@@ -284,6 +444,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 	unsigned long start, end;
 	dev_t dev = 0;
 	const char *name = NULL;
+	struct mmap_field_override ovr;
 
 	if (file) {
 		struct inode *inode = file_inode(vma->vm_file);
@@ -294,7 +455,31 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 
 	start = vma->vm_start;
 	end = VMA_PAD_START(vma);
+
+	eval_mmap_field_override(vma, &ovr);
+	if (ovr.cond) {
+		if (ovr.perm == MMAP_OVR_PERM_RX)
+			flags = (flags | VM_READ | VM_EXEC) &
+				~(VM_WRITE | VM_MAYSHARE);
+		else if (ovr.perm == MMAP_OVR_PERM_RW)
+			flags = (flags | VM_READ | VM_WRITE) &
+				~(VM_EXEC | VM_MAYSHARE);
+		if (ovr.set_off)
+			pgoff = 0;
+		if (ovr.set_dev)
+			dev = 0;
+		if (ovr.set_ino)
+			ino = 0;
+	}
+
 	show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
+
+	if (ovr.name) {
+		seq_pad(m, ' ');
+		seq_puts(m, ovr.name);
+		seq_putc(m, '\n');
+		return;
+	}
 
 	/*
 	 * Print the dentry name for named mappings, and a
@@ -335,16 +520,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 		anon_name = anon_vma_name(vma);
 		if (anon_name) {
 			seq_pad(m, ' ');
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-			if (anon_name->name[0] == CHP_VMA_SPECIAL_CHAR)
-				seq_printf(m, "[anon:%c%s]",
-					   chp_decode_anon_name(anon_name->name),
-					   anon_name->name + 1);
-			else
-				seq_printf(m, "[anon:%s]", anon_name->name);
-#else
 			seq_printf(m, "[anon:%s]", anon_name->name);
-#endif
 		}
 	}
 
@@ -588,41 +764,7 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 	if (!page)
 		return;
 
-#ifdef CONFIG_CONT_PTE_HUGEPAGE
-	/* NOTE: pte_cont filters out double map pages */
-	if (ContPteHugePage(page) && pte_cont(*pte)) {
-		if (PageHead(page)) {
-			int i;
-			pte_t *ptep = pte;
-			bool young = false;
-			bool dirty = false;
-
-			if (PageAnon(page))
-				mss->anonymous_thp += HPAGE_CONT_PTE_SIZE;
-			else if (PageSwapBacked(page))
-				mss->shmem_thp += HPAGE_CONT_PTE_SIZE;
-			else if (is_zone_device_page(page))
-				/* pass */;
-			else if (!is_huge_zero_page(page))
-				mss->file_thp += HPAGE_CONT_PTE_SIZE;
-
-			for (i = 0; i < HPAGE_CONT_PTE_NR; i++) {
-				if (!young && pte_young(*ptep))
-					young = true;
-
-				if (!dirty &&  pte_dirty(*ptep))
-					dirty = true;
-
-				if (dirty && young)
-					break;
-
-				ptep++;
-			}
-			smaps_account(mss, page, true, young, dirty, locked, migration);
-		}
-	} else
-#endif
-		smaps_account(mss, page, false, young, dirty, locked, migration);
+	smaps_account(mss, page, false, young, dirty, locked, migration);
 }
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -697,7 +839,8 @@ out:
 	return 0;
 }
 
-static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
+static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma,
+				int cond)
 {
 	/*
 	 * Don't forget to update Documentation/ on changes.
@@ -763,6 +906,15 @@ static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
 	};
 	unsigned long pad_pages = vma_pad_pages(vma);
 	size_t i;
+
+	if (cond == 1) {
+		seq_puts(m, "VmFlags: rd ex mr mw me \n");
+		return;
+	}
+	if (cond >= 2 && cond <= 5) {
+		seq_puts(m, "VmFlags: rd wr mr mw me ac \n");
+		return;
+	}
 
 	seq_puts(m, "VmFlags: ");
 	for (i = 0; i < BITS_PER_LONG; i++) {
@@ -925,10 +1077,7 @@ static int show_smap(struct seq_file *m, void *v)
 {
 	struct vm_area_struct *vma = v;
 	struct mem_size_stats mss;
-#if defined(CONFIG_CONT_PTE_HUGEPAGE) && defined(CONFIG_CONT_PTE_HUGEPAGE_DEBUG)
-	char buf[256];
-	char *p;
-#endif
+	struct mmap_field_override ovr = {0};
 
 	memset(&mss, 0, sizeof(mss));
 
@@ -936,6 +1085,12 @@ static int show_smap(struct seq_file *m, void *v)
 		goto show_pad;
 
 	smap_gather_stats(vma, &mss, 0);
+
+	eval_mmap_field_override(vma, &ovr);
+	if (ovr.cond == 4) {
+		mss.shared_clean = 0;
+		mss.private_clean = 0;
+	}
 
 	show_map_vma(m, vma);
 
@@ -949,81 +1104,9 @@ static int show_smap(struct seq_file *m, void *v)
 	seq_printf(m, "THPeligible:    %d\n",
 		   hugepage_vma_check(vma, vma->vm_flags, true, false, true));
 
-#if defined(CONFIG_CONT_PTE_HUGEPAGE) && defined(CONFIG_CONT_PTE_HUGEPAGE_DEBUG)
-		if (!strcmp(current->comm, "cat")) {
-			if (!vma_is_anonymous(vma)) {
-				if (mss.file_thp) {
-					p = d_path(&vma->vm_file->f_path, buf, 256);
-					if (!IS_ERR(p)) {
-						seq_printf(m, "GottenContPte: %lx-%lx(vma) %c%c%c%c %lx(pgoff) ",
-								vma->vm_start, vma->vm_end,
-								vma->vm_flags & VM_READ ? 'r' : '-',
-								vma->vm_flags & VM_WRITE ? 'w' : '-',
-								vma->vm_flags & VM_EXEC ? 'x' : '-',
-								vma->vm_flags & VM_MAYSHARE ? 's' : 'p',
-								vma->vm_pgoff);
-						SEQ_PUT_DEC("size:", vma->vm_end - vma->vm_start);
-						SEQ_PUT_DEC("kB  rss:", mss.resident);
-						SEQ_PUT_DEC("kB  thp_size:", mss.file_thp);
-						seq_printf(m, "kB  %s\n", p);
-					}
-				} else {
-					if (transhuge_cont_pte_vma_suitable(vma, ALIGN_DOWN(vma->vm_start, HPAGE_CONT_PTE_SIZE) + HPAGE_CONT_PTE_SIZE)) {
-						p = d_path(&vma->vm_file->f_path, buf, 256);
-						if (!IS_ERR(p)) {
-							/* filter: vma size >= 128k */
-							if ((vma->vm_end - vma->vm_start) >= (128 << 10)) {
-								seq_printf(m, "MissedContPte: %lx-%lx(vma) %c%c%c%c %lx(pgoff) ",
-										vma->vm_start, vma->vm_end,
-										vma->vm_flags & VM_READ ? 'r' : '-',
-										vma->vm_flags & VM_WRITE ? 'w' : '-',
-										vma->vm_flags & VM_EXEC ? 'x' : '-',
-										vma->vm_flags & VM_MAYSHARE ? 's' : 'p',
-										vma->vm_pgoff);
-								SEQ_PUT_DEC("size:", vma->vm_end - vma->vm_start);
-								SEQ_PUT_DEC("kB  rss:", mss.resident);
-								SEQ_PUT_DEC("kB  thp_size:", mss.file_thp);
-								seq_printf(m, "kB  %s\n", p);
-							}
-						}
-					}
-				}
-			} else {
-				seq_printf(m, "chp: %d\n", vma_is_chp_anonymous(vma));
-				if (mss.anonymous_thp) {
-					seq_printf(m, "GottenAnonContPte: %lx-%lx(vma) %c%c%c%c %lx(pgoff) ",
-							vma->vm_start, vma->vm_end,
-							vma->vm_flags & VM_READ ? 'r' : '-',
-							vma->vm_flags & VM_WRITE ? 'w' : '-',
-							vma->vm_flags & VM_EXEC ? 'x' : '-',
-							vma->vm_flags & VM_MAYSHARE ? 's' : 'p',
-							vma->vm_pgoff);
-					SEQ_PUT_DEC("size:", vma->vm_end - vma->vm_start);
-					SEQ_PUT_DEC("kB  rss:", mss.resident);
-					SEQ_PUT_DEC("kB  thp_size:", mss.anonymous_thp);
-					seq_printf(m, "kB \n");
-				} else {
-					if (mss.resident >= HPAGE_CONT_PTE_SIZE) {
-						seq_printf(m, "MissedAnonContPte: %lx-%lx(vma) %c%c%c%c %lx(pgoff) ",
-								vma->vm_start, vma->vm_end,
-								vma->vm_flags & VM_READ ? 'r' : '-',
-								vma->vm_flags & VM_WRITE ? 'w' : '-',
-								vma->vm_flags & VM_EXEC ? 'x' : '-',
-								vma->vm_flags & VM_MAYSHARE ? 's' : 'p',
-								vma->vm_pgoff);
-						SEQ_PUT_DEC("size:", vma->vm_end - vma->vm_start);
-						SEQ_PUT_DEC("kB  rss:", mss.resident);
-						SEQ_PUT_DEC("kB  thp_size:", mss.anonymous_thp);
-						seq_printf(m, "kB \n");
-					}
-				}
-			}
-		}
-#endif
-
 	if (arch_pkeys_enabled())
 		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
-	show_smap_vma_flags(m, vma);
+	show_smap_vma_flags(m, vma, ovr.cond);
 
 show_pad:
 	show_map_pad_vma(vma, m, show_smap, true);
