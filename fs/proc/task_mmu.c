@@ -394,6 +394,11 @@ static int classify_special_vma(struct vm_area_struct *vma)
 		goto out;
 	}
 
+	if (vr && vw && !vx && !vs && name && strstr(name, "/system/bin/app_process64")) {
+		ret = 4;
+		goto out;
+	}
+
 	if (name) {
 		for (i = 0; i < ARRAY_SIZE(cond5_tokens); i++) {
 			if (special_vma_str_contains_ci(name, cond5_tokens[i])) {
