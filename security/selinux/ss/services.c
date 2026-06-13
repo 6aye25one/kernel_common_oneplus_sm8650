@@ -1517,6 +1517,81 @@ out:
 	return rc;
 }
 
+static const char * const selinux_hidden_context_types[] = {
+	"system_server", "process", "execmem", "fsck_untrusted",
+	"capability", "sys_admin", "shell", "su",
+	"transition", "adbd", "adbroot", "adb_root",
+	"binder", "call", "untrusted_app", "magisk",
+	"magisk_file", "rezygisk", "tw", "treatwheel",
+	"zygisk", "ksu", "ksu_file", "file",
+	"read", "lsposed_file", "adb_data_file", "dir",
+	"search", "droidspaces", "docker", "qemu",
+	"apk_data", "execute", "root", "rootfs",
+	"tmpfs", "fifo_file", "open", "associate",
+	"filesystem", "kernel", "apk_data_file", "zygote",
+	"fp", "ap_file", "fp_file", "ap",
+	"apd", "lsp", "lspd", "msd",
+	"xposed_file", "dex2oat", "dex2oat_exec", "execute_no_trans",
+	"xposed_data", "lsposed_data", "aosp", "lineage",
+	"crdroid",
+};
+
+static bool selinux_ci_substr(const char *haystack, const char *needle)
+{
+	size_t nlen = strlen(needle);
+
+	if (!nlen)
+		return false;
+	for (; *haystack; haystack++) {
+		if (!strncasecmp(haystack, needle, nlen))
+			return true;
+	}
+	return false;
+}
+
+static bool selinux_caller_is_app_zygote(struct policydb *policydb,
+					 struct sidtab *sidtab)
+{
+	struct context *ccontext;
+	const char *ctype;
+
+	ccontext = sidtab_search(sidtab, current_sid());
+	if (!ccontext)
+		return false;
+	ctype = sym_name(policydb, SYM_TYPES, ccontext->type - 1);
+	return ctype && !strcmp(ctype, "app_zygote");
+}
+
+static bool selinux_zygote_hidden_context(struct selinux_state *state,
+					  const char *scontext)
+{
+	struct selinux_policy *policy;
+	struct policydb *policydb;
+	struct sidtab *sidtab;
+	bool hidden = false;
+	unsigned int i;
+
+	rcu_read_lock();
+	policy = rcu_dereference(state->policy);
+	if (!policy)
+		goto out;
+	policydb = &policy->policydb;
+	sidtab = policy->sidtab;
+
+	if (!selinux_caller_is_app_zygote(policydb, sidtab))
+		goto out;
+
+	for (i = 0; i < ARRAY_SIZE(selinux_hidden_context_types); i++) {
+		if (selinux_ci_substr(scontext, selinux_hidden_context_types[i])) {
+			hidden = true;
+			break;
+		}
+	}
+out:
+	rcu_read_unlock();
+	return hidden;
+}
+
 static int security_context_to_sid_core(struct selinux_state *state,
 					const char *scontext, u32 scontext_len,
 					u32 *sid, u32 def_sid, gfp_t gfp_flags,
@@ -1553,6 +1628,11 @@ static int security_context_to_sid_core(struct selinux_state *state,
 		goto out;
 	}
 	*sid = SECSID_NULL;
+
+	if (selinux_zygote_hidden_context(state, scontext2)) {
+		rc = -EINVAL;
+		goto out;
+	}
 
 	if (force) {
 		/* Save another copy for storing in uninterpreted form */
